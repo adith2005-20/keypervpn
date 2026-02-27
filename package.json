@@ -1,0 +1,32 @@
+{
+    "name": "keypervpn",
+    "version": "1.0.0",
+    "description": "Peer-to-peer VPN with hybrid post-quantum cryptography (Kyber-768 + X25519 + ChaCha20-Poly1305) and Ink terminal UI",
+    "type": "module",
+    "scripts": {
+        "start": "tsx src/index.ts",
+        "signal": "tsx src/signaling/server.ts",
+        "build": "tsc"
+    },
+    "dependencies": {
+        "mlkem": "^2.5.0",
+        "@noble/curves": "^1.8.1",
+        "@noble/ciphers": "^1.2.1",
+        "@noble/hashes": "^1.7.1",
+        "ink": "^6.0.0",
+        "ink-gradient": "^4.0.0",
+        "ink-big-text": "^2.0.0",
+        "react": "^19.0.0",
+        "ws": "^8.18.0"
+    },
+    "optionalDependencies": {
+        "tuntap2": "^0.9.1"
+    },
+    "devDependencies": {
+        "typescript": "^5.7.3",
+        "tsx": "^4.19.2",
+        "@types/ws": "^8.5.14",
+        "@types/react": "^19.0.0",
+        "@types/node": "^22.0.0"
+    }
+}
