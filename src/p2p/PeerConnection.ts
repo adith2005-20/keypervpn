@@ -15,6 +15,8 @@ const PACKET_TYPE_PROBE_ACK = 0x02;
 const PACKET_TYPE_DATA = 0x03;
 const PACKET_TYPE_PING = 0x04;
 const PACKET_TYPE_PONG = 0x05;
+const PACKET_TYPE_ECHO = 0x06;
+const PACKET_TYPE_ECHO_REPLY = 0x07;
 
 const PROBE_INTERVAL_MS = 500;
 const PROBE_TIMEOUT_MS = 30_000;
@@ -27,6 +29,7 @@ export interface PeerConnectionEvents {
     disconnected: [];
     error: [err: Error];
     latency: [ms: number];
+    'echo-reply': [payload: string, rttMs: number];
 }
 
 export class PeerConnection extends EventEmitter {
@@ -192,6 +195,60 @@ export class PeerConnection extends EventEmitter {
                 }
                 break;
             }
+
+            case PACKET_TYPE_ECHO: {
+                // Received encrypted echo — decrypt, then send back as echo-reply
+                this._packetsReceived++;
+                this._bytesReceived += msg.length;
+                if (!this.sessionKeys || msg.length < 14) break;
+                const echoNonce = msg.subarray(1, 13);
+                const echoCiphertext = msg.subarray(13);
+                try {
+                    const echoPlain = decrypt(
+                        new Uint8Array(echoCiphertext),
+                        new Uint8Array(echoNonce),
+                        this.sessionKeys,
+                    );
+                    // Send it back encrypted as ECHO_REPLY
+                    const { ciphertext: replyCt, nonce: replyNonce } = encrypt(
+                        echoPlain,
+                        this.sessionKeys,
+                    );
+                    const replyPacket = Buffer.alloc(1 + 12 + replyCt.length);
+                    replyPacket[0] = PACKET_TYPE_ECHO_REPLY;
+                    Buffer.from(replyNonce).copy(replyPacket, 1);
+                    Buffer.from(replyCt).copy(replyPacket, 13);
+                    this.sendRaw(replyPacket);
+                    this._packetsSent++;
+                    this._bytesSent += replyPacket.length;
+                } catch { /* decryption fail — ignore */ }
+                break;
+            }
+
+            case PACKET_TYPE_ECHO_REPLY: {
+                // Received echo reply — decrypt and emit
+                this._packetsReceived++;
+                this._bytesReceived += msg.length;
+                if (!this.sessionKeys || msg.length < 14) break;
+                const replyNonce2 = msg.subarray(1, 13);
+                const replyCiphertext = msg.subarray(13);
+                try {
+                    const replyPlain = decrypt(
+                        new Uint8Array(replyCiphertext),
+                        new Uint8Array(replyNonce2),
+                        this.sessionKeys,
+                    );
+                    // Payload format: [timestamp(8 bytes) | message]
+                    const payloadBuf = Buffer.from(replyPlain);
+                    if (payloadBuf.length >= 8) {
+                        const sentTime = Number(payloadBuf.readBigUInt64BE(0));
+                        const rtt = Date.now() - sentTime;
+                        const message = payloadBuf.subarray(8).toString('utf-8');
+                        this.emit('echo-reply', message, rtt);
+                    }
+                } catch { /* decryption fail — ignore */ }
+                break;
+            }
         }
     }
 
@@ -256,6 +313,34 @@ export class PeerConnection extends EventEmitter {
 
     getLocalPort(): number {
         return this.localPort;
+    }
+
+    /**
+     * Send an encrypted echo test payload to the peer.
+     * The peer will decrypt it and send it back encrypted.
+     * Payload format: [timestamp(8) | message]
+     */
+    sendEcho(message: string = 'KeyperVPN echo test'): void {
+        if (this.state !== ConnectionState.Connected || !this.sessionKeys) return;
+
+        const msgBuf = Buffer.from(message, 'utf-8');
+        const payload = Buffer.alloc(8 + msgBuf.length);
+        payload.writeBigUInt64BE(BigInt(Date.now()), 0);
+        msgBuf.copy(payload, 8);
+
+        const { ciphertext, nonce } = encrypt(
+            new Uint8Array(payload),
+            this.sessionKeys,
+        );
+
+        const packet = Buffer.alloc(1 + 12 + ciphertext.length);
+        packet[0] = PACKET_TYPE_ECHO;
+        Buffer.from(nonce).copy(packet, 1);
+        Buffer.from(ciphertext).copy(packet, 13);
+
+        this.sendRaw(packet);
+        this._packetsSent++;
+        this._bytesSent += packet.length;
     }
 
     close(): void {

@@ -333,6 +333,10 @@ export class VPNTunnel extends EventEmitter {
         this.peerConnection.on('latency', (ms: number) => {
             // Latency updates handled by stats reporting
         });
+
+        this.peerConnection.on('echo-reply', (payload: string, rttMs: number) => {
+            this.log(`✅ ECHO REPLY: "${payload}" — round-trip ${rttMs}ms (encrypted end-to-end)`);
+        });
     }
 
     private startPacketRelay(): void {
@@ -373,6 +377,21 @@ export class VPNTunnel extends EventEmitter {
 
     getPeerId(): string {
         return this.peerId;
+    }
+
+    /**
+     * Send a test echo through the encrypted tunnel.
+     * The remote peer decrypts, then re-encrypts and sends back.
+     * Proves end-to-end encrypted data relay works.
+     */
+    sendTestData(message?: string): void {
+        if (this.state !== ConnectionState.Connected) {
+            this.log('Cannot send test data — not connected to a peer yet');
+            return;
+        }
+        const msg = message ?? `Hello from ${this.peerId} @ ${new Date().toLocaleTimeString()}`;
+        this.log(`📤 Sending echo test: "${msg}"`);
+        this.peerConnection?.sendEcho(msg);
     }
 
     /**
