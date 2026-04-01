@@ -1,112 +1,177 @@
 # KeyperVPN
 
-Post-quantum peer-to-peer VPN with hybrid cryptography and terminal UI.
+KeyperVPN is a relay-assisted overlay VPN demo designed to show two Linux machines communicating as if they are on the same private network while all overlay traffic remains encrypted in transit.
 
-## Architecture
+This build is aimed at a reviewer demo:
 
-```mermaid
-graph LR
-    A[Client TUN] -->|IP packets| B[CryptoEngine]
-    B -->|Encrypted| C[UDP P2P Tunnel]
-    C -->|Encrypted| D[CryptoEngine]
-    D -->|IP packets| E[Server TUN]
-    F[Signaling Server] -.->|WebSocket| C
-    G[STUN] -.->|NAT Discovery| C
-```
+- two internet-connected Linux hosts
+- one Raspberry Pi running the signaling server and UDP relay
+- a terminal UI that shows tunnel state, crypto mode, latency, traffic, and morphing mode
+- Wireshark-visible encrypted UDP packets with constant packet size
 
-**Crypto Stack:** Kyber-768 (post-quantum KEM) + X25519 (classical ECDH) + ChaCha20-Poly1305 (AEAD)
+## What This Demo Implements
 
-Both shared secrets are combined via HKDF-SHA256 to derive session keys, providing security against both classical and quantum adversaries.
+### 1. Overlay VPN addressing
 
-## Quick Start
+Each peer gets a TUN interface address on the same virtual subnet:
 
-### 1. Install Dependencies
+- server: `10.44.0.1`
+- client: `10.44.0.2`
 
-```bash
-npm install
-```
+The TUN device captures IP packets for the remote overlay peer and injects decrypted packets back into the kernel.
 
-### 2. Start Signaling Server
+### 2. Hybrid post-quantum session setup
 
-```bash
-npm run signal
-```
+The data plane uses:
 
-### 3. Start VPN Server (Terminal 2)
+- ML-KEM-768 (`mlkem`) for post-quantum key encapsulation
+- X25519 for classical ECDH
+- ChaCha20-Poly1305 for authenticated encryption
 
-```bash
-sudo npm start server
-```
+The client initiates the session. Both shared secrets are combined through HKDF-SHA256 to derive directional send/receive keys.
 
-### 4. Start VPN Client (Terminal 3)
+### 3. Relay-assisted encrypted transport
 
-```bash
-sudo npm start client
-```
+The Raspberry Pi hosts:
 
-### 5. Test Connectivity
+- a WebSocket signaling server on port `8080`
+- a UDP relay on port `8081`
 
-```bash
-ping 10.8.0.1  # From client
-```
+Peers exchange public keys over signaling, derive end-to-end session keys locally, then send encrypted UDP frames through the relay. The relay sees only ciphertext and metadata needed for forwarding.
 
-## Configuration
+### 4. Traffic morphing
 
-| Setting          | Default                       |
-| ---------------- | ----------------------------- |
-| Signaling Server | `ws://localhost:8080`         |
-| STUN Server      | `stun.l.google.com:19302`     |
-| VPN Subnet       | `10.8.0.0/24`                 |
-| Server VPN IP    | `10.8.0.1`                    |
-| Client VPN IP    | `10.8.0.2`                    |
-| TUN MTU          | `1420`                        |
-| TUN Device       | `pqvpn0`                      |
+Every encrypted overlay frame is padded to a constant size before transmission. By default:
 
-Override signaling URL with `SIGNAL_URL` env var:
+- `MORPH_PACKET_SIZE=1200`
 
-```bash
-SIGNAL_URL=ws://your-server:8080 sudo npm start client
-```
+This means payload size is not directly exposed by packet length in Wireshark. You should see repeated UDP datagrams of the same size during steady-state traffic.
 
-## Project Structure
+### 5. Demo TUI
 
-```
-keypervpn/
-├── src/
-│   ├── signaling/
-│   │   └── server.ts           # WebSocket signaling server
-│   ├── vpn/
-│   │   ├── TunDevice.ts        # TUN interface wrapper
-│   │   ├── CryptoEngine.ts     # Kyber-768 + X25519 + ChaCha20
-│   │   └── VPNTunnel.ts        # Main orchestrator
-│   ├── p2p/
-│   │   ├── STUNClient.ts       # NAT discovery
-│   │   ├── SignalingClient.ts  # WebSocket client
-│   │   └── PeerConnection.ts   # UDP hole punching & data relay
-│   ├── ui/
-│   │   └── App.tsx             # Ink terminal UI
-│   ├── types.ts                # Shared interfaces
-│   └── index.ts                # Entry point
-├── package.json
-├── tsconfig.json
-└── README.md
+The Ink TUI shows:
+
+- connection state
+- crypto suite
+- transport mode
+- morphing mode
+- peer ID and peer VPN IP
+- packet and byte counters
+- live event log
+
+Press `e` to send an encrypted echo probe through the overlay.
+
+## Repository Layout
+
+```text
+src/
+├── index.ts                 CLI entry point
+├── types.ts                 Shared protocol and stats types
+├── signaling/server.ts      WebSocket signaling + UDP relay
+├── p2p/SignalingClient.ts   Control-plane client
+├── p2p/RelayTransport.ts    UDP relay transport
+├── vpn/CryptoEngine.ts      Hybrid PQ + classical key exchange and AEAD
+├── vpn/TunDevice.ts         Linux TUN wrapper
+├── vpn/VPNTunnel.ts         Main orchestrator
+└── ui/App.tsx               Ink terminal UI
 ```
 
 ## Requirements
 
-- **Node.js** 18+
-- **Linux** (primary) or macOS
-- **Root/sudo** privileges (TUN device requires it)
-- Network access for STUN discovery
+- Node.js 20+
+- Linux on both peers for the real TUN demo
+- `sudo` on both peers
+- an internet-reachable Linux host for signaling
+- `iproute2` installed on peers
+- UDP reachability to the relay port
 
-## Limitations
+## Install
 
-- No TURN relay — symmetric NAT will fail
-- IPv4 only
-- Single peer (no mesh)
-- No DNS handling (configure manually)
-- Linux primary, macOS best-effort
+```bash
+npm install
+npm run build
+```
 
-## License
+## Raspberry Pi Setup
 
-MIT
+Run this on the Pi:
+
+```bash
+SIGNAL_PORT=8080 RELAY_PORT=8081 RELAY_HOST=<public-pi-ip-or-dns> npm run signal
+```
+
+If the Pi is behind a firewall, allow:
+
+- TCP `8080`
+- UDP `8081`
+
+## Peer Setup
+
+### Server peer
+
+```bash
+SIGNAL_URL=ws://<pi-host>:8080 RELAY_HOST=<pi-host> RELAY_PORT=8081 sudo npm start server
+```
+
+### Client peer
+
+```bash
+SIGNAL_URL=ws://<pi-host>:8080 RELAY_HOST=<pi-host> RELAY_PORT=8081 sudo npm start client
+```
+
+## Reviewer Demo Flow
+
+1. Start the Pi signaling/relay server.
+2. Start the server peer.
+3. Start the client peer.
+4. Wait for both TUIs to show `CONNECTED`.
+5. On the client, press `e` to send an encrypted echo probe.
+6. Run `ping 10.44.0.1` from the client and `ping 10.44.0.2` from the server.
+7. Open Wireshark on either peer and capture on the physical NIC.
+8. Filter by the relay UDP port, for example `udp.port == 8081`.
+
+Expected result:
+
+- packets are UDP ciphertext, not raw ICMP payload
+- packet sizes are flat or nearly flat because of constant-size morphing
+
+## Wireshark Notes
+
+For the cleanest screenshot:
+
+- start a capture before pressing `e`
+- filter `udp.port == 8081`
+- add the `Length` column
+
+You should be able to show:
+
+- repeated same-size encrypted UDP datagrams
+- no readable application payload
+- overlay traffic continuing while pings succeed across `10.44.0.0/24`
+
+## Local Smoke Test Without TUN
+
+For development on systems without `/dev/net/tun`:
+
+```bash
+KEYPERVPN_NO_TUN=1 npm start server
+KEYPERVPN_NO_TUN=1 npm start client
+```
+
+This validates control plane, handshake, encrypted transport, and echo probes without root networking.
+
+## Current Limitations
+
+- This build uses a relay path for reliability; it does not yet attempt direct NAT traversal.
+- It supports a single server peer and a single client peer for the demo.
+- Traffic morphing is fixed-size padding, not adaptive probabilistic shaping.
+- The real same-subnet demo target is Linux; no-TUN mode is only for development validation.
+
+## Recommended Offload To The Raspberry Pi
+
+Your Raspberry Pi should host both:
+
+- signaling server
+- UDP relay
+
+That is the correct place to offload internet-facing coordination. The peers keep all session keys locally, so the Pi does not terminate the encrypted overlay.

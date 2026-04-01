@@ -1,69 +1,47 @@
-// ============================================================
-// KeyperVPN — Entry Point
-// Parses CLI args, creates VPN tunnel, renders TUI
-// ============================================================
-
 import { PeerRole, type VPNConfig } from './types.js';
-import { VPNTunnel } from './vpn/VPNTunnel.js';
 import { renderApp } from './ui/App.js';
-
-// ── CLI Argument Parsing ─────────────────────────────────────
+import { VPNTunnel } from './vpn/VPNTunnel.js';
 
 const args = process.argv.slice(2);
 const mode = args[0]?.toLowerCase();
 
-if (!mode || (mode !== 'server' && mode !== 'client')) {
+if (mode !== 'server' && mode !== 'client') {
     console.log(`
-╔╗╔═╦═╦═╦═╦═╦═╦╗╔╗
-║╠╣╔╣╩╣╬║╩╣╔╣╬║╠╣║
-╚╝╚╝╚═╩═╩═╩╝╚═╩╝╚╝
+Repository demo modes:
+  sudo npm start server
+  sudo npm start client
+  npm run signal
 
-Usage:
-  sudo npm start server    Start as VPN server (10.8.0.1)
-  sudo npm start client    Start as VPN client (10.8.0.2)
-  npm run signal           Start signaling server
-
-Options:
-  server    Accept incoming VPN connections
-  client    Connect to a VPN server peer
+Optional environment:
+  SIGNAL_URL=ws://raspberrypi:8080
+  RELAY_HOST=raspberrypi
+  RELAY_PORT=8081
+  KEYPERVPN_NO_TUN=1
 `);
     process.exit(1);
 }
 
-// ── Check Root Privileges ────────────────────────────────────
-
-if (process.platform !== 'win32' && process.getuid?.() !== 0) {
-    console.error('Error: Root privileges required. Please run with sudo.');
-    console.error('  sudo npm start server');
-    console.error('  sudo npm start client');
-    process.exit(1);
-}
-
-// ── Configuration ────────────────────────────────────────────
-
 const role = mode === 'server' ? PeerRole.Server : PeerRole.Client;
+const noTun = process.env.KEYPERVPN_NO_TUN === '1';
 
 const config: VPNConfig = {
     role,
-    tunName: 'pqvpn0',
-    tunAddress: role === PeerRole.Server ? '10.8.0.1' : '10.8.0.2',
+    tunName: 'keyper0',
+    tunAddress: role === PeerRole.Server ? '10.44.0.1' : '10.44.0.2',
+    peerTunAddress: role === PeerRole.Server ? '10.44.0.2' : '10.44.0.1',
     tunNetmask: '255.255.255.0',
-    tunMTU: 1420,
-    signalingUrl: process.env.SIGNAL_URL || 'ws://localhost:8080',
-    stunServer: 'stun.l.google.com',
-    stunPort: 19302,
-    subnet: '10.8.0.0/24',
+    tunMTU: 1280,
+    signalingUrl: process.env.SIGNAL_URL ?? 'ws://127.0.0.1:8080',
+    relayHost: process.env.RELAY_HOST,
+    relayPort: Number(process.env.RELAY_PORT ?? 8081),
+    noTun,
+    morphPacketSize: Number(process.env.MORPH_PACKET_SIZE ?? 1200),
 };
 
-// ── Start ────────────────────────────────────────────────────
-
-async function main() {
+async function main(): Promise<void> {
     const tunnel = new VPNTunnel(config);
-
-    // Render the TUI
     renderApp(tunnel);
 
-    // Handle graceful shutdown
     const shutdown = async () => {
         await tunnel.shutdown();
         process.exit(0);
@@ -72,16 +50,10 @@ async function main() {
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
 
-    // Start the tunnel
-    try {
-        await tunnel.start();
-    } catch (err) {
-        // Error is displayed in TUI logs
-        // Give user time to see the error before potentially exiting
-    }
+    await tunnel.start();
 }
 
-main().catch((err) => {
-    console.error(`Fatal error: ${(err as Error).message}`);
+main().catch((error) => {
+    console.error((error as Error).message);
     process.exit(1);
 });

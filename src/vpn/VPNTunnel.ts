@@ -1,52 +1,63 @@
-// ============================================================
-// KeyperVPN — VPN Tunnel Orchestrator
-// Ties together TUN device, crypto, signaling, and P2P
-// ============================================================
-
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
     ConnectionState,
     PeerRole,
+    type CryptoKeys,
+    type RelayEndpoint,
+    type SessionKeys,
+    type SignalingSessionReady,
     type VPNConfig,
     type VPNStats,
-    type PeerInfo,
-    type CryptoKeys,
-    type SessionKeys,
-    type SignalingOffer,
-    type SignalingAnswer,
 } from '../types.js';
-import { TunDevice } from './TunDevice.js';
-import {
-    generateKeys,
-    initiateKeyExchange,
-    completeKeyExchange,
-    getCryptoMode,
-} from './CryptoEngine.js';
-import { discoverPublicEndpoint, getLocalIpAsync } from '../p2p/STUNClient.js';
 import { SignalingClient } from '../p2p/SignalingClient.js';
-import { PeerConnection } from '../p2p/PeerConnection.js';
+import { RelayTransport } from '../p2p/RelayTransport.js';
+import {
+    completeKeyExchange,
+    encrypt,
+    generateKeys,
+    getCryptoMode,
+    initiateKeyExchange,
+    decrypt,
+} from './CryptoEngine.js';
+import { TunDevice } from './TunDevice.js';
+
+const INNER_TYPE_IP_PACKET = 0x01;
+const INNER_TYPE_PING = 0x02;
+const INNER_TYPE_PONG = 0x03;
+const INNER_TYPE_ECHO = 0x04;
+const INNER_TYPE_ECHO_REPLY = 0x05;
+const INNER_HEADER_SIZE = 3;
+const OUTER_NONCE_SIZE = 12;
+const AEAD_TAG_SIZE = 16;
+const PING_INTERVAL_MS = 2500;
 
 export interface VPNTunnelEvents {
     'state-change': [state: ConnectionState];
     stats: [stats: VPNStats];
-    error: [err: Error];
+    error: [error: Error];
     log: [message: string];
 }
 
 export class VPNTunnel extends EventEmitter {
-    private config: VPNConfig;
-    private peerId: string;
+    private readonly config: VPNConfig;
+    private readonly peerId: string;
+    private state = ConnectionState.Disconnected;
+    private connectedAt: Date | null = null;
     private keys: CryptoKeys | null = null;
     private sessionKeys: SessionKeys | null = null;
-    private tun: TunDevice | null = null;
-    private signalingClient: SignalingClient | null = null;
-    private peerConnection: PeerConnection | null = null;
-    private state: ConnectionState = ConnectionState.Disconnected;
-    private statsInterval: ReturnType<typeof setInterval> | null = null;
-    private connectedAt: Date | null = null;
     private remotePeerId: string | null = null;
     private remotePeerVpnIp: string | null = null;
+    private signalingClient: SignalingClient | null = null;
+    private relayTransport: RelayTransport | null = null;
+    private relayEndpoint: RelayEndpoint | null = null;
+    private sessionReady: SignalingSessionReady | null = null;
+    private tun: TunDevice | null = null;
+    private statsInterval: ReturnType<typeof setInterval> | null = null;
+    private pingInterval: ReturnType<typeof setInterval> | null = null;
+    private latencyMs = 0;
+    private handshakeConfirmed = false;
+    private transportReady = false;
 
     constructor(config: VPNConfig) {
         super();
@@ -54,392 +65,385 @@ export class VPNTunnel extends EventEmitter {
         this.peerId = crypto.randomUUID().slice(0, 8);
     }
 
-    private log(msg: string): void {
-        this.emit('log', msg);
-    }
-
-    private setState(newState: ConnectionState): void {
-        this.state = newState;
-        this.emit('state-change', newState);
-    }
-
-    /**
-     * Start the VPN tunnel.
-     */
-    async start(): Promise<void> {
-        try {
-            // 1. Check privileges
-            this.log('Checking privileges...');
-            this.checkPrivileges();
-
-            // 2. Generate crypto keys
-            this.log('Generating hybrid post-quantum keys (Kyber-768 + X25519)...');
-            this.setState(ConnectionState.Connecting);
-            this.keys = await generateKeys();
-            this.log('Keys generated successfully');
-
-            // 3. Discover public endpoint via STUN
-            this.log('Discovering public endpoint via STUN...');
-            let stunInfo;
-            try {
-                stunInfo = await discoverPublicEndpoint(
-                    this.config.stunServer,
-                    this.config.stunPort,
-                );
-                this.log(`Public endpoint: ${stunInfo.publicIp}:${stunInfo.publicPort}`);
-            } catch (err) {
-                this.log(`STUN discovery failed: ${(err as Error).message}. Using local address.`);
-                const localIp = await getLocalIpAsync();
-                stunInfo = {
-                    publicIp: localIp,
-                    publicPort: 0,
-                    localIp,
-                    localPort: 0,
-                    natType: 'unknown' as const,
-                };
-            }
-
-            // 4. Set up peer connection (UDP socket)
-            this.peerConnection = new PeerConnection(0);
-            const localPort = await this.peerConnection.bind();
-            stunInfo.localPort = localPort;
-            this.log(`UDP socket bound on port ${localPort}`);
-
-            // 5. Connect to signaling server
-            this.log(`Connecting to signaling server: ${this.config.signalingUrl}`);
-            this.signalingClient = new SignalingClient(this.config.signalingUrl, this.peerId);
-            this.setupSignalingHandlers();
-            this.signalingClient.connect();
-
-            // Wait for signaling connection
-            await this.waitForSignaling();
-
-            // 6. Register with signaling server
-            this.signalingClient.register(
-                {
-                    kyber: Buffer.from(this.keys.kyberPublicKey).toString('base64'),
-                    x25519: Buffer.from(this.keys.x25519PublicKey).toString('base64'),
-                },
-                stunInfo,
-            );
-            this.log(`Registered as peer: ${this.peerId}`);
-
-            // 7. Role-based flow
-            if (this.config.role === PeerRole.Client) {
-                this.log('Role: Client — searching for server peer...');
-                // Small delay to let server register first
-                await this.delay(1000);
-                this.signalingClient.listPeers();
-            } else {
-                this.log('Role: Server — waiting for incoming connections...');
-            }
-
-            // 8. Setup peer connection events
-            this.setupPeerConnectionHandlers();
-
-            // 9. Start stats reporting
-            this.startStatsReporting();
-
-        } catch (err) {
-            this.setState(ConnectionState.Error);
-            this.emit('error', err as Error);
-            throw err;
-        }
-    }
-
-    private checkPrivileges(): void {
-        if (process.platform !== 'win32' && process.getuid?.() !== 0) {
-            throw new Error(
-                'Root privileges required. Please run with sudo:\n' +
-                '  sudo npm start server    (for server mode)\n' +
-                '  sudo npm start client    (for client mode)',
-            );
-        }
-    }
-
-    private setupSignalingHandlers(): void {
-        if (!this.signalingClient) return;
-
-        this.signalingClient.on('peer-list', async (peers: PeerInfo[]) => {
-            this.log(`Received peer list: ${peers.length} peer(s) available`);
-            if (peers.length === 0) {
-                this.log('No peers available. Retrying in 3 seconds...');
-                setTimeout(() => this.signalingClient?.listPeers(), 3000);
-                return;
-            }
-
-            // Connect to the first available peer
-            const target = peers[0]!;
-            this.remotePeerId = target.peerId;
-            this.remotePeerVpnIp = this.config.role === PeerRole.Client ? '10.8.0.1' : '10.8.0.2';
-            this.log(`Initiating connection to peer: ${target.peerId}`);
-
-            // Perform key exchange as initiator
-            if (this.keys) {
-                const remoteKyberPK = new Uint8Array(Buffer.from(target.publicKey.kyber, 'base64'));
-                const remoteX25519PK = new Uint8Array(Buffer.from(target.publicKey.x25519, 'base64'));
-
-                const { sessionKeys, kyberCiphertext } = await initiateKeyExchange(
-                    this.keys,
-                    remoteKyberPK,
-                    remoteX25519PK,
-                );
-
-                this.sessionKeys = sessionKeys;
-                this.peerConnection?.setSessionKeys(sessionKeys);
-                this.log('Hybrid key exchange completed (initiator)');
-
-                // Build candidates
-                const candidates = [
-                    { ip: target.stunInfo.publicIp, port: target.stunInfo.publicPort },
-                ];
-                if (target.stunInfo.localIp && target.stunInfo.localPort) {
-                    candidates.push({ ip: target.stunInfo.localIp, port: target.stunInfo.localPort });
-                }
-
-                // Send offer with Kyber ciphertext
-                this.signalingClient?.sendOffer(target.peerId, {
-                    localPort: this.peerConnection?.getLocalPort() ?? 0,
-                    candidates: [
-                        {
-                            ip: target.stunInfo.localIp || '0.0.0.0',
-                            port: this.peerConnection?.getLocalPort() ?? 0,
-                        },
-                    ],
-                    kyberCiphertext: kyberCiphertext
-                        ? Buffer.from(kyberCiphertext).toString('base64')
-                        : undefined,
-                });
-
-                // Start hole punching
-                this.peerConnection?.startHolePunch(candidates);
-                this.setState(ConnectionState.Handshaking);
-            }
-        });
-
-        this.signalingClient.on('offer', (msg: SignalingOffer) => {
-            this.log(`Received offer from peer: ${msg.fromPeerId}`);
-            this.remotePeerId = msg.fromPeerId;
-            this.remotePeerVpnIp = '10.8.0.2';
-
-            // Complete key exchange as responder
-            if (this.keys && msg.sdp.kyberCiphertext) {
-                const kyberCt = new Uint8Array(Buffer.from(msg.sdp.kyberCiphertext, 'base64'));
-
-                // We need the remote X25519 public key — it was shared during registration
-                // For now, we'll need to get it from the peer list
-                this.signalingClient?.listPeers();
-
-                // Store the offer for processing after we get the peer's X25519 key
-                this.once('_remote_x25519_key', async (remoteX25519PK: Uint8Array) => {
-                    const { sessionKeys } = await completeKeyExchange(this.keys!, kyberCt, remoteX25519PK);
-                    this.sessionKeys = sessionKeys;
-                    this.peerConnection?.setSessionKeys(sessionKeys);
-                    this.log('Hybrid key exchange completed (responder)');
-
-                    // Send answer
-                    this.signalingClient?.sendAnswer(msg.fromPeerId, {
-                        localPort: this.peerConnection?.getLocalPort() ?? 0,
-                        candidates: msg.sdp.candidates,
-                    });
-
-                    // Start hole punching to the offerer
-                    const candidates = msg.sdp.candidates.slice();
-                    this.peerConnection?.startHolePunch(candidates);
-                    this.setState(ConnectionState.Handshaking);
-                });
-
-                // Also trigger peer list lookup to get X25519 key
-                this.signalingClient?.on('peer-list', (peers: PeerInfo[]) => {
-                    const remotePeer = peers.find((p) => p.peerId === msg.fromPeerId);
-                    if (remotePeer) {
-                        const remoteX25519PK = new Uint8Array(
-                            Buffer.from(remotePeer.publicKey.x25519, 'base64'),
-                        );
-                        this.emit('_remote_x25519_key', remoteX25519PK);
-                    }
-                });
-                this.signalingClient?.listPeers();
-            }
-        });
-
-        this.signalingClient.on('answer', (msg: SignalingAnswer) => {
-            this.log(`Received answer from peer: ${msg.fromPeerId}`);
-            // Answer received — hole punching should already be in progress
-            // Add any new candidates from the answer
-            if (msg.sdp.candidates.length > 0) {
-                this.peerConnection?.startHolePunch(msg.sdp.candidates);
-            }
-        });
-
-        this.signalingClient.on('error', (err: Error) => {
-            this.log(`Signaling error: ${err.message}`);
-        });
-
-        this.signalingClient.on('disconnected', () => {
-            this.log('Signaling server disconnected, will reconnect...');
-        });
-    }
-
-    private setupPeerConnectionHandlers(): void {
-        if (!this.peerConnection) return;
-
-        this.peerConnection.on('connected', async () => {
-            this.log('P2P connection established!');
-            this.connectedAt = new Date();
-            this.setState(ConnectionState.Connected);
-
-            // Open TUN device
-            try {
-                this.tun = new TunDevice(
-                    this.config.tunName,
-                    this.config.tunAddress,
-                    this.config.tunNetmask,
-                    this.config.tunMTU,
-                );
-                await this.tun.open();
-                this.tun.setupRouting(this.config.subnet);
-                this.log(`TUN device ${this.config.tunName} opened at ${this.config.tunAddress}`);
-
-                // Start packet relay
-                this.startPacketRelay();
-            } catch (err) {
-                this.log(`TUN setup failed: ${(err as Error).message}`);
-                this.log('VPN tunnel running without TUN device (data relay only)');
-            }
-        });
-
-        this.peerConnection.on('data', (data: Buffer) => {
-            // Received decrypted data — inject into TUN
-            if (this.tun?.isRunning) {
-                this.tun.write(data);
-            }
-        });
-
-        this.peerConnection.on('disconnected', () => {
-            this.log('Peer disconnected');
-            this.setState(ConnectionState.Disconnected);
-            this.connectedAt = null;
-        });
-
-        this.peerConnection.on('error', (err: Error) => {
-            this.log(`Peer connection error: ${err.message}`);
-            if (err.message.includes('symmetric NAT')) {
-                this.log('ERROR: Symmetric NAT detected. Direct P2P connection not possible without a TURN relay.');
-                this.setState(ConnectionState.Error);
-            }
-        });
-
-        this.peerConnection.on('latency', (ms: number) => {
-            // Latency updates handled by stats reporting
-        });
-
-        this.peerConnection.on('echo-reply', (payload: string, rttMs: number) => {
-            this.log(`✅ ECHO REPLY: "${payload}" — round-trip ${rttMs}ms (encrypted end-to-end)`);
-        });
-    }
-
-    private startPacketRelay(): void {
-        if (!this.tun) return;
-
-        this.tun.on('data', (packet: Buffer) => {
-            // Read from TUN → encrypt → send to peer
-            if (this.peerConnection && this.state === ConnectionState.Connected) {
-                this.peerConnection.sendData(packet);
-            }
-        });
-
-        this.tun.on('error', (err: Error) => {
-            this.log(`TUN error: ${err.message}`);
-        });
-    }
-
-    private startStatsReporting(): void {
-        this.statsInterval = setInterval(() => {
-            this.emit('stats', this.getStats());
-        }, 500);
+    getPeerId(): string {
+        return this.peerId;
     }
 
     getStats(): VPNStats {
         return {
             state: this.state,
-            bytesSent: this.peerConnection?.bytesSent ?? 0,
-            bytesReceived: this.peerConnection?.bytesReceived ?? 0,
-            packetsSent: this.peerConnection?.packetsSent ?? 0,
-            packetsReceived: this.peerConnection?.packetsReceived ?? 0,
-            latencyMs: this.peerConnection?.latencyMs ?? 0,
+            bytesSent: this.relayTransport?.bytesSent ?? 0,
+            bytesReceived: this.relayTransport?.bytesReceived ?? 0,
+            packetsSent: this.relayTransport?.packetsSent ?? 0,
+            packetsReceived: this.relayTransport?.packetsReceived ?? 0,
+            latencyMs: this.latencyMs,
             connectedAt: this.connectedAt,
             peerId: this.remotePeerId,
             peerVpnIp: this.remotePeerVpnIp,
             cryptoMode: getCryptoMode(),
+            transportMode: 'UDP relay overlay',
+            morphMode: `constant ${this.config.morphPacketSize}B`,
         };
     }
 
-    getPeerId(): string {
-        return this.peerId;
+    async start(): Promise<void> {
+        try {
+            this.setState(ConnectionState.Connecting);
+            this.checkPrivileges();
+            this.log(`Booting ${this.config.role} node ${this.peerId}`);
+
+            this.keys = await generateKeys();
+            const publicKey = {
+                kyber: Buffer.from(this.keys.kyberPublicKey).toString('base64'),
+                x25519: Buffer.from(this.keys.x25519PublicKey).toString('base64'),
+            };
+
+            this.signalingClient = new SignalingClient(
+                this.config.signalingUrl,
+                this.peerId,
+                this.config.role,
+                publicKey,
+            );
+
+            this.setupSignalingHandlers();
+            this.signalingClient.connect();
+            await this.waitForRegistered();
+            this.startStatsReporting();
+        } catch (error) {
+            this.setState(ConnectionState.Error);
+            this.emit('error', error as Error);
+            throw error;
+        }
     }
 
-    /**
-     * Send a test echo through the encrypted tunnel.
-     * The remote peer decrypts, then re-encrypts and sends back.
-     * Proves end-to-end encrypted data relay works.
-     */
     sendTestData(message?: string): void {
         if (this.state !== ConnectionState.Connected) {
-            this.log('Cannot send test data — not connected to a peer yet');
+            this.log('Tunnel is not connected yet');
             return;
         }
-        const msg = message ?? `Hello from ${this.peerId} @ ${new Date().toLocaleTimeString()}`;
-        this.log(`📤 Sending echo test: "${msg}"`);
-        this.peerConnection?.sendEcho(msg);
+
+        const payload = Buffer.from(
+            `${message ?? `echo from ${this.peerId}`} @ ${new Date().toISOString()}`,
+            'utf8',
+        );
+        this.sendInnerPacket(INNER_TYPE_ECHO, payload);
+        this.log(`Sent encrypted echo probe (${payload.length} bytes before morphing)`);
     }
 
-    /**
-     * Gracefully shut down the VPN tunnel.
-     */
     async shutdown(): Promise<void> {
-        this.log('Shutting down KeyperVPN...');
-
         if (this.statsInterval) {
             clearInterval(this.statsInterval);
             this.statsInterval = null;
         }
+        if (this.pingInterval) {
+            clearInterval(this.pingInterval);
+            this.pingInterval = null;
+        }
 
-        this.peerConnection?.close();
+        this.relayTransport?.close();
         this.signalingClient?.close();
         this.tun?.close();
 
+        this.relayTransport = null;
+        this.signalingClient = null;
+        this.tun = null;
+        this.connectedAt = null;
+        this.sessionKeys = null;
+        this.handshakeConfirmed = false;
+        this.transportReady = false;
+
         this.setState(ConnectionState.Disconnected);
-        this.log('KeyperVPN shut down cleanly.');
+        this.log('Shutdown complete');
     }
 
-    // ── Helpers ──────────────────────────────────────────────
+    private checkPrivileges(): void {
+        if (!this.config.noTun && process.getuid?.() !== 0) {
+            throw new Error('Root privileges are required unless KEYPERVPN_NO_TUN=1 is set.');
+        }
+    }
 
-    private waitForSignaling(): Promise<void> {
-        return new Promise((resolve, reject) => {
-            if (this.signalingClient?.connected) {
-                resolve();
+    private setupSignalingHandlers(): void {
+        if (!this.signalingClient) {
+            return;
+        }
+
+        this.signalingClient.on('registered', async (_peerId, relay) => {
+            this.relayEndpoint = {
+                host: this.config.relayHost ?? relay.host,
+                port: this.config.relayPort || relay.port,
+            };
+            this.log(`Connected to control plane. Relay endpoint ${this.relayEndpoint.host}:${this.relayEndpoint.port}`);
+        });
+
+        this.signalingClient.on('session-ready', async (message) => {
+            this.sessionReady = message;
+            this.remotePeerId = message.peer.peerId;
+            this.remotePeerVpnIp = this.config.peerTunAddress;
+            this.setState(ConnectionState.Handshaking);
+            this.log(`Matched with peer ${message.peer.peerId} (${message.peer.role})`);
+
+            await this.ensureRelayTransport(message.sessionId, message.relay);
+
+            if (message.initiatorPeerId === this.peerId && this.keys) {
+                const remoteKyber = new Uint8Array(Buffer.from(message.peer.publicKey.kyber, 'base64'));
+                const remoteX25519 = new Uint8Array(Buffer.from(message.peer.publicKey.x25519, 'base64'));
+                const result = await initiateKeyExchange(this.keys, remoteKyber, remoteX25519);
+                this.sessionKeys = result.sessionKeys;
+                this.signalingClient?.sendSessionInit(
+                    message.peer.peerId,
+                    Buffer.from(result.kyberCiphertext ?? new Uint8Array()).toString('base64'),
+                );
+                this.log('Hybrid key exchange initiated');
+            }
+        });
+
+        this.signalingClient.on('session-init', async (message) => {
+            if (!this.keys || !this.sessionReady || message.fromPeerId !== this.sessionReady.peer.peerId) {
                 return;
             }
 
-            const timeout = setTimeout(() => {
-                reject(new Error('Signaling server connection timeout'));
-            }, 10_000);
+            const remoteX25519 = new Uint8Array(
+                Buffer.from(this.sessionReady.peer.publicKey.x25519, 'base64'),
+            );
+            const kyberCiphertext = new Uint8Array(Buffer.from(message.kyberCiphertext, 'base64'));
+            const result = await completeKeyExchange(this.keys, kyberCiphertext, remoteX25519);
+            this.sessionKeys = result.sessionKeys;
+            this.signalingClient?.sendSessionAck(message.fromPeerId);
+            this.log('Hybrid key exchange completed');
+            this.tryEstablishConnected();
+        });
 
-            this.signalingClient?.once('connected', () => {
-                clearTimeout(timeout);
-                this.log('Connected to signaling server');
-                resolve();
-            });
+        this.signalingClient.on('session-ack', (message) => {
+            if (message.fromPeerId !== this.remotePeerId) {
+                return;
+            }
+            this.handshakeConfirmed = true;
+            this.log('Peer accepted encrypted session');
+            this.tryEstablishConnected();
+        });
 
-            this.signalingClient?.once('error', (err: Error) => {
-                clearTimeout(timeout);
-                reject(new Error(`Signaling connection failed: ${err.message}`));
-            });
+        this.signalingClient.on('peer-left', (peerId) => {
+            if (peerId === this.remotePeerId) {
+                this.log('Remote peer disconnected from the control plane');
+                void this.shutdown();
+            }
+        });
+
+        this.signalingClient.on('disconnected', () => {
+            this.log('Signaling connection lost; reconnecting');
+        });
+
+        this.signalingClient.on('error', (error) => {
+            this.log(`Signaling error: ${error.message}`);
+            this.emit('error', error);
         });
     }
 
-    private delay(ms: number): Promise<void> {
-        return new Promise((resolve) => setTimeout(resolve, ms));
+    private async ensureRelayTransport(sessionId: string, relay: RelayEndpoint): Promise<void> {
+        if (this.relayTransport) {
+            return;
+        }
+
+        const endpoint = {
+            host: this.config.relayHost ?? this.relayEndpoint?.host ?? relay.host,
+            port: this.config.relayPort || this.relayEndpoint?.port || relay.port,
+        };
+        this.relayTransport = new RelayTransport(endpoint, { sessionId, peerId: this.peerId });
+        this.relayTransport.on('packet', (packet) => this.handleRelayPacket(packet));
+        this.relayTransport.on('error', (error) => {
+            this.log(`Relay transport error: ${error.message}`);
+            this.emit('error', error);
+        });
+        const localPort = await this.relayTransport.bind();
+        this.relayTransport.register();
+        this.transportReady = true;
+        this.log(`UDP transport bound on ${localPort}, relay registration sent`);
+        this.tryEstablishConnected();
+    }
+
+    private tryEstablishConnected(): void {
+        if (!this.sessionKeys || !this.transportReady) {
+            return;
+        }
+
+        if (this.config.role === PeerRole.Client) {
+            if (!this.handshakeConfirmed) {
+                return;
+            }
+        } else {
+            this.handshakeConfirmed = true;
+        }
+
+        if (this.state === ConnectionState.Connected) {
+            return;
+        }
+
+        this.connectedAt = new Date();
+        this.setState(ConnectionState.Connected);
+        this.log('Encrypted overlay is up');
+
+        if (!this.config.noTun) {
+            void this.openTun();
+        } else {
+            this.log('No-TUN mode enabled for local validation');
+        }
+
+        this.startPingLoop();
+    }
+
+    private async openTun(): Promise<void> {
+        try {
+            this.tun = new TunDevice(
+                this.config.tunName,
+                this.config.tunAddress,
+                this.config.tunNetmask,
+                this.config.tunMTU,
+            );
+            await this.tun.open();
+            this.tun.setupRouting(this.config.peerTunAddress);
+            this.tun.on('data', (packet) => {
+                this.sendInnerPacket(INNER_TYPE_IP_PACKET, packet);
+            });
+            this.tun.on('error', (error) => {
+                this.log(`TUN error: ${error.message}`);
+            });
+            this.log(`TUN ${this.tun.deviceName} online at ${this.config.tunAddress}`);
+        } catch (error) {
+            this.log(`TUN initialization failed: ${(error as Error).message}`);
+            this.emit('error', error as Error);
+        }
+    }
+
+    private startPingLoop(): void {
+        if (this.pingInterval) {
+            return;
+        }
+
+        this.pingInterval = setInterval(() => {
+            const payload = Buffer.alloc(8);
+            payload.writeBigUInt64BE(BigInt(Date.now()), 0);
+            this.sendInnerPacket(INNER_TYPE_PING, payload);
+        }, PING_INTERVAL_MS);
+    }
+
+    private handleRelayPacket(packet: Buffer): void {
+        if (!this.sessionKeys) {
+            return;
+        }
+
+        try {
+            const { kind, body } = this.decryptFrame(packet);
+            switch (kind) {
+                case INNER_TYPE_IP_PACKET:
+                    this.tun?.write(body);
+                    break;
+                case INNER_TYPE_PING: {
+                    this.sendInnerPacket(INNER_TYPE_PONG, body);
+                    break;
+                }
+                case INNER_TYPE_PONG: {
+                    if (body.length >= 8) {
+                        this.latencyMs = Date.now() - Number(body.readBigUInt64BE(0));
+                    }
+                    break;
+                }
+                case INNER_TYPE_ECHO: {
+                    this.sendInnerPacket(INNER_TYPE_ECHO_REPLY, body);
+                    break;
+                }
+                case INNER_TYPE_ECHO_REPLY:
+                    this.log(`Encrypted echo reply: ${body.toString('utf8')}`);
+                    break;
+            }
+        } catch (error) {
+            this.log(`Dropped undecipherable packet: ${(error as Error).message}`);
+        }
+    }
+
+    private sendInnerPacket(kind: number, body: Buffer): void {
+        if (!this.sessionKeys || !this.relayTransport) {
+            return;
+        }
+
+        const maxBodyLength = this.getPlaintextCapacity() - INNER_HEADER_SIZE;
+        if (body.length > maxBodyLength) {
+            this.log(`Packet too large for current morph size (${body.length} > ${maxBodyLength})`);
+            return;
+        }
+
+        const plaintext = Buffer.alloc(this.getPlaintextCapacity());
+        crypto.randomFillSync(plaintext);
+        plaintext[0] = kind;
+        plaintext.writeUInt16BE(body.length, 1);
+        body.copy(plaintext, INNER_HEADER_SIZE);
+
+        const encrypted = encrypt(new Uint8Array(plaintext), this.sessionKeys);
+        const frame = Buffer.alloc(OUTER_NONCE_SIZE + encrypted.ciphertext.length);
+        Buffer.from(encrypted.nonce).copy(frame, 0);
+        Buffer.from(encrypted.ciphertext).copy(frame, OUTER_NONCE_SIZE);
+        this.relayTransport.send(frame);
+    }
+
+    private decryptFrame(packet: Buffer): { kind: number; body: Buffer } {
+        if (packet.length !== this.config.morphPacketSize) {
+            throw new Error(`unexpected frame size ${packet.length}`);
+        }
+
+        const nonce = packet.subarray(0, OUTER_NONCE_SIZE);
+        const ciphertext = packet.subarray(OUTER_NONCE_SIZE);
+        const plaintext = Buffer.from(
+            decrypt(new Uint8Array(ciphertext), new Uint8Array(nonce), this.sessionKeys!),
+        );
+
+        const kind = plaintext[0] ?? 0;
+        const bodyLength = plaintext.readUInt16BE(1);
+        if (bodyLength > plaintext.length - INNER_HEADER_SIZE) {
+            throw new Error('invalid body length');
+        }
+
+        return {
+            kind,
+            body: plaintext.subarray(INNER_HEADER_SIZE, INNER_HEADER_SIZE + bodyLength),
+        };
+    }
+
+    private getPlaintextCapacity(): number {
+        return this.config.morphPacketSize - OUTER_NONCE_SIZE - AEAD_TAG_SIZE;
+    }
+
+    private startStatsReporting(): void {
+        if (this.statsInterval) {
+            return;
+        }
+
+        this.statsInterval = setInterval(() => {
+            this.emit('stats', this.getStats());
+        }, 500);
+    }
+
+    private setState(state: ConnectionState): void {
+        this.state = state;
+        this.emit('state-change', state);
+    }
+
+    private log(message: string): void {
+        this.emit('log', message);
+    }
+
+    private waitForRegistered(): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('Timed out connecting to signaling server'));
+            }, 10000);
+
+            this.signalingClient?.once('registered', () => {
+                clearTimeout(timeout);
+                resolve();
+            });
+            this.signalingClient?.once('error', (error) => {
+                clearTimeout(timeout);
+                reject(error);
+            });
+        });
     }
 }

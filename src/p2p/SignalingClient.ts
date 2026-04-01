@@ -1,164 +1,154 @@
-// ============================================================
-// KeyperVPN — Signaling Client
-// WebSocket client for communicating with the signaling server
-// ============================================================
-
 import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
 import type {
-    STUNInfo,
-    PeerInfo,
+    PeerRole,
+    RelayEndpoint,
     SignalingMessage,
-    SignalingOffer,
-    SignalingAnswer,
-    SignalingIceCandidate,
-    SignalingPeerList,
+    SignalingRegistered,
+    SignalingSessionAck,
+    SignalingSessionInit,
+    SignalingSessionReady,
 } from '../types.js';
 
 export interface SignalingClientEvents {
     connected: [];
     disconnected: [];
-    registered: [peerId: string];
-    'peer-list': [peers: PeerInfo[]];
-    offer: [msg: SignalingOffer];
-    answer: [msg: SignalingAnswer];
-    'ice-candidate': [msg: SignalingIceCandidate];
-    error: [err: Error];
+    registered: [peerId: string, relay: RelayEndpoint];
+    'session-ready': [message: SignalingSessionReady];
+    'session-init': [message: SignalingSessionInit];
+    'session-ack': [message: SignalingSessionAck];
+    'peer-left': [peerId: string];
+    error: [error: Error];
 }
 
 export class SignalingClient extends EventEmitter {
     private ws: WebSocket | null = null;
-    private url: string;
-    private peerId: string;
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    private _connected = false;
+    private readonly url: string;
+    private readonly peerId: string;
+    private readonly role: PeerRole;
+    private readonly publicKey: { kyber: string; x25519: string };
+    private connectedState = false;
+    private manualClose = false;
 
-    constructor(url: string, peerId: string) {
+    constructor(
+        url: string,
+        peerId: string,
+        role: PeerRole,
+        publicKey: { kyber: string; x25519: string },
+    ) {
         super();
         this.url = url;
         this.peerId = peerId;
+        this.role = role;
+        this.publicKey = publicKey;
     }
 
     get connected(): boolean {
-        return this._connected;
+        return this.connectedState;
     }
 
     connect(): void {
-        if (this.ws) return;
+        if (this.ws) {
+            return;
+        }
 
+        this.manualClose = false;
         this.ws = new WebSocket(this.url);
 
         this.ws.on('open', () => {
-            this._connected = true;
+            this.connectedState = true;
             this.emit('connected');
+            this.register();
+        });
+
+        this.ws.on('close', () => {
+            this.connectedState = false;
+            this.ws = null;
+            this.emit('disconnected');
+            if (!this.manualClose) {
+                this.scheduleReconnect();
+            }
+        });
+
+        this.ws.on('error', (error) => {
+            this.emit('error', error);
         });
 
         this.ws.on('message', (raw) => {
-            let msg: Record<string, unknown>;
+            let message: SignalingMessage;
             try {
-                msg = JSON.parse(raw.toString());
+                message = JSON.parse(raw.toString()) as SignalingMessage;
             } catch {
                 return;
             }
 
-            switch (msg.type) {
-                case 'registered':
-                    this.emit('registered', msg.peerId as string);
+            switch (message.type) {
+                case 'registered': {
+                    const registered = message as SignalingRegistered;
+                    this.emit('registered', registered.peerId, registered.relay);
                     break;
-                case 'peer-list':
-                    this.emit('peer-list', (msg as unknown as SignalingPeerList).peers);
+                }
+                case 'session-ready':
+                    this.emit('session-ready', message as SignalingSessionReady);
                     break;
-                case 'offer':
-                    this.emit('offer', msg as unknown as SignalingOffer);
+                case 'session-init':
+                    this.emit('session-init', message as SignalingSessionInit);
                     break;
-                case 'answer':
-                    this.emit('answer', msg as unknown as SignalingAnswer);
+                case 'session-ack':
+                    this.emit('session-ack', message as SignalingSessionAck);
                     break;
-                case 'ice-candidate':
-                    this.emit('ice-candidate', msg as unknown as SignalingIceCandidate);
+                case 'peer-left':
+                    this.emit('peer-left', message.peerId);
                     break;
                 case 'error':
-                    this.emit('error', new Error(msg.message as string));
+                    this.emit('error', new Error(message.message));
                     break;
             }
         });
+    }
 
-        this.ws.on('close', () => {
-            this._connected = false;
-            this.ws = null;
-            this.emit('disconnected');
-            this.scheduleReconnect();
-        });
-
-        this.ws.on('error', (err) => {
-            this.emit('error', err);
+    private register(): void {
+        this.send({
+            type: 'register',
+            peerId: this.peerId,
+            role: this.role,
+            publicKey: this.publicKey,
         });
     }
 
+    sendSessionInit(targetPeerId: string, kyberCiphertext: string): void {
+        this.send({
+            type: 'session-init',
+            fromPeerId: this.peerId,
+            targetPeerId,
+            kyberCiphertext,
+        });
+    }
+
+    sendSessionAck(targetPeerId: string): void {
+        this.send({
+            type: 'session-ack',
+            fromPeerId: this.peerId,
+            targetPeerId,
+        });
+    }
+
+    private send(message: SignalingMessage): void {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify(message));
+        }
+    }
+
     private scheduleReconnect(): void {
-        if (this.reconnectTimer) return;
+        if (this.reconnectTimer) {
+            return;
+        }
+
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
             this.connect();
         }, 3000);
-    }
-
-    register(
-        publicKey: { kyber: string; x25519: string },
-        stunInfo: STUNInfo,
-    ): void {
-        this.send({
-            type: 'register',
-            peerId: this.peerId,
-            publicKey,
-            stunInfo,
-        });
-    }
-
-    listPeers(): void {
-        this.send({ type: 'list-peers' });
-    }
-
-    sendOffer(
-        targetPeerId: string,
-        sdp: SignalingOffer['sdp'],
-    ): void {
-        this.send({
-            type: 'offer',
-            fromPeerId: this.peerId,
-            targetPeerId,
-            sdp,
-        });
-    }
-
-    sendAnswer(
-        targetPeerId: string,
-        sdp: SignalingAnswer['sdp'],
-    ): void {
-        this.send({
-            type: 'answer',
-            fromPeerId: this.peerId,
-            targetPeerId,
-            sdp,
-        });
-    }
-
-    sendCandidate(
-        targetPeerId: string,
-        candidate: { ip: string; port: number },
-    ): void {
-        this.send({
-            type: 'ice-candidate',
-            fromPeerId: this.peerId,
-            targetPeerId,
-            candidate,
-        });
-    }
-
-    private send(msg: unknown): void {
-        if (this.ws?.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify(msg));
-        }
     }
 
     close(): void {
@@ -166,10 +156,13 @@ export class SignalingClient extends EventEmitter {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+
+        this.manualClose = true;
         if (this.ws) {
             this.ws.close();
             this.ws = null;
         }
-        this._connected = false;
+
+        this.connectedState = false;
     }
 }

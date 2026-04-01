@@ -1,175 +1,103 @@
-// ============================================================
-// KeyperVPN — TUN Device Wrapper
-// Creates and manages the virtual network interface
-// ============================================================
-
 import { EventEmitter } from 'node:events';
 import { execSync } from 'node:child_process';
-import os from 'node:os';
 
-// tuntap2 is a native module — dynamic import to handle platforms where it's unavailable
-let tuntap: any;
+interface TunInstance {
+    name: string;
+    mtu: number;
+    ipv4: string;
+    isUp: boolean;
+    on(event: 'data', handler: (packet: Buffer) => void): void;
+    on(event: 'error', handler: (error: Error) => void): void;
+    write(packet: Buffer): void;
+    release(): void;
+}
 
 export interface TunDeviceEvents {
     data: [packet: Buffer];
-    error: [err: Error];
+    error: [error: Error];
     close: [];
 }
 
 export class TunDevice extends EventEmitter {
-    private tun: any = null;
-    private name: string;
-    private address: string;
-    private netmask: string;
-    private mtu: number;
+    private tun: TunInstance | null = null;
+    private readonly requestedName: string;
+    private readonly address: string;
+    private readonly netmask: string;
+    private readonly mtu: number;
     private running = false;
+    private actualName: string | null = null;
 
-    constructor(
-        name: string = 'pqvpn0',
-        address: string = '10.8.0.1',
-        netmask: string = '255.255.255.0',
-        mtu: number = 1420,
-    ) {
+    constructor(name: string, address: string, netmask: string, mtu: number) {
         super();
-        this.name = name;
+        this.requestedName = name;
         this.address = address;
         this.netmask = netmask;
         this.mtu = mtu;
     }
 
-    /**
-     * Open and configure the TUN device.
-     * Requires root/sudo privileges.
-     */
     async open(): Promise<void> {
-        try {
-            tuntap = await import('tuntap2');
-        } catch (err) {
-            throw new Error(
-                'Failed to load tuntap2 module. Ensure it is installed and you are running on Linux. ' +
-                `Original error: ${(err as Error).message}`,
-            );
-        }
+        const module = await import('tuntap2/dist/index.js');
+        const Tun = (module as { Tun: new () => TunInstance }).Tun;
+        const tun = new Tun();
 
-        const Tun = tuntap.Tun || tuntap.default?.Tun || tuntap;
+        tun.mtu = this.mtu;
+        tun.ipv4 = `${this.address}/${TunDevice.netmaskToPrefix(this.netmask)}`;
+        tun.isUp = true;
 
-        this.tun = new Tun();
-
-        // Open the device
-        this.tun.open();
-
-        // Configure the interface via OS commands
-        const platform = os.platform();
-
-        try {
-            if (platform === 'linux') {
-                execSync(`ip addr add ${this.address}/24 dev ${this.name}`, { stdio: 'pipe' });
-                execSync(`ip link set dev ${this.name} mtu ${this.mtu}`, { stdio: 'pipe' });
-                execSync(`ip link set dev ${this.name} up`, { stdio: 'pipe' });
-            } else if (platform === 'darwin') {
-                // macOS TUN setup
-                execSync(
-                    `ifconfig ${this.name} ${this.address} ${this.address} netmask ${this.netmask} mtu ${this.mtu} up`,
-                    { stdio: 'pipe' },
-                );
-            } else {
-                throw new Error(`Unsupported platform: ${platform}. KeyperVPN requires Linux or macOS.`);
-            }
-        } catch (err) {
-            throw new Error(
-                `Failed to configure TUN interface. Are you running as root/sudo? ` +
-                `Error: ${(err as Error).message}`,
-            );
-        }
-
+        this.tun = tun;
+        this.actualName = tun.name || this.requestedName;
         this.running = true;
 
-        // Read packets from the TUN device
-        this.tun.on('data', (packet: Buffer) => {
+        tun.on('data', (packet) => {
             if (this.running) {
                 this.emit('data', packet);
             }
         });
 
-        this.tun.on('error', (err: Error) => {
-            this.emit('error', err);
+        tun.on('error', (error) => {
+            this.emit('error', error);
         });
     }
 
-    /**
-     * Write a decrypted IP packet back into the TUN device.
-     */
     write(packet: Buffer): void {
-        if (this.running && this.tun) {
-            try {
-                this.tun.write(packet);
-            } catch (err) {
-                this.emit('error', err as Error);
-            }
+        if (!this.running || !this.tun) {
+            return;
+        }
+
+        try {
+            this.tun.write(packet);
+        } catch (error) {
+            this.emit('error', error as Error);
         }
     }
 
-    /**
-     * Close and tear down the TUN interface.
-     */
+    setupRouting(remoteIp: string): void {
+        const name = this.deviceName;
+        execSync(`ip route replace ${remoteIp}/32 dev ${name}`, { stdio: 'pipe' });
+    }
+
     close(): void {
         this.running = false;
+        const name = this.actualName;
+
         if (this.tun) {
             try {
-                this.tun.close();
-            } catch { /* ignore */ }
+                this.tun.release();
+            } catch {
+                // Ignore cleanup races.
+            }
             this.tun = null;
         }
 
-        // Attempt to clean up routes
-        try {
-            const platform = os.platform();
-            if (platform === 'linux') {
-                execSync(`ip link set dev ${this.name} down`, { stdio: 'pipe' });
-                execSync(`ip link delete ${this.name}`, { stdio: 'pipe' });
+        if (name) {
+            try {
+                execSync(`ip link set ${name} down`, { stdio: 'pipe' });
+            } catch {
+                // Best effort.
             }
-        } catch { /* best effort cleanup */ }
+        }
 
         this.emit('close');
-    }
-
-    /**
-     * Set up routing so VPN subnet goes through the TUN device.
-     */
-    setupRouting(subnet: string = '10.8.0.0/24'): void {
-        const platform = os.platform();
-        try {
-            if (platform === 'linux') {
-                execSync(`ip route add ${subnet} dev ${this.name}`, { stdio: 'pipe' });
-            } else if (platform === 'darwin') {
-                execSync(`route add -net ${subnet} -interface ${this.name}`, { stdio: 'pipe' });
-            }
-        } catch {
-            // Route may already exist — ignore
-        }
-    }
-
-    /**
-     * Parse basic IPv4 header to extract source and destination IP.
-     */
-    static parseIPv4Header(packet: Buffer): {
-        srcIp: string;
-        dstIp: string;
-        protocol: number;
-        totalLength: number;
-    } | null {
-        if (packet.length < 20) return null;
-
-        const version = (packet[0]! >> 4) & 0x0f;
-        if (version !== 4) return null;
-
-        const totalLength = packet.readUInt16BE(2);
-        const protocol = packet[9]!;
-
-        const srcIp = `${packet[12]!}.${packet[13]!}.${packet[14]!}.${packet[15]!}`;
-        const dstIp = `${packet[16]!}.${packet[17]!}.${packet[18]!}.${packet[19]!}`;
-
-        return { srcIp, dstIp, protocol, totalLength };
     }
 
     get isRunning(): boolean {
@@ -177,6 +105,16 @@ export class TunDevice extends EventEmitter {
     }
 
     get deviceName(): string {
-        return this.name;
+        return this.actualName ?? this.requestedName;
+    }
+
+    private static netmaskToPrefix(netmask: string): number {
+        return netmask
+            .split('.')
+            .map((segment) => Number(segment).toString(2).padStart(8, '0'))
+            .join('')
+            .split('')
+            .filter((bit) => bit === '1')
+            .length;
     }
 }

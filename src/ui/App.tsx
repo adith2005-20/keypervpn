@@ -1,246 +1,141 @@
-// ============================================================
-// KeyperVPN — Terminal UI (Ink)
-// Renders status, stats, and peer info in the terminal
-// ============================================================
-
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Box, Text, render, useApp, useInput } from 'ink';
-import type { VPNStats } from '../types.js';
-import { ConnectionState } from '../types.js';
+import { ConnectionState, type VPNStats } from '../types.js';
 import type { VPNTunnel } from '../vpn/VPNTunnel.js';
 
-// ── Helpers ──────────────────────────────────────────────────
-
 function formatBytes(bytes: number): string {
-    if (bytes === 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    const val = bytes / Math.pow(1024, i);
-    return `${val.toFixed(1)} ${units[i]}`;
+    if (bytes < 1024) {
+        return `${bytes}B`;
+    }
+    if (bytes < 1024 * 1024) {
+        return `${(bytes / 1024).toFixed(1)}KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(2)}MB`;
 }
 
-function formatUptime(connectedAt: Date | null): string {
-    if (!connectedAt) return '—';
-    const seconds = Math.floor((Date.now() - connectedAt.getTime()) / 1000);
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = seconds % 60;
-    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+function uptime(connectedAt: Date | null): string {
+    if (!connectedAt) {
+        return '--:--:--';
+    }
+    const totalSeconds = Math.floor((Date.now() - connectedAt.getTime()) / 1000);
+    const hours = Math.floor(totalSeconds / 3600).toString().padStart(2, '0');
+    const minutes = Math.floor((totalSeconds % 3600) / 60).toString().padStart(2, '0');
+    const seconds = (totalSeconds % 60).toString().padStart(2, '0');
+    return `${hours}:${minutes}:${seconds}`;
 }
 
-function stateColor(state: ConnectionState): string {
+function stateTone(state: ConnectionState): string {
     switch (state) {
-        case ConnectionState.Connected: return 'green';
-        case ConnectionState.Connecting: return 'yellow';
-        case ConnectionState.Handshaking: return 'cyan';
-        case ConnectionState.Disconnected: return 'gray';
-        case ConnectionState.Error: return 'red';
-        default: return 'white';
+        case ConnectionState.Connected:
+            return '#6CFF8F';
+        case ConnectionState.Handshaking:
+            return '#62F2FF';
+        case ConnectionState.Connecting:
+            return '#FFE066';
+        case ConnectionState.Error:
+            return '#FF5D73';
+        default:
+            return '#7A7E8A';
     }
 }
-
-function stateIcon(state: ConnectionState): string {
-    switch (state) {
-        case ConnectionState.Connected: return '●';
-        case ConnectionState.Connecting: return '◌';
-        case ConnectionState.Handshaking: return '◎';
-        case ConnectionState.Disconnected: return '○';
-        case ConnectionState.Error: return '✗';
-        default: return '?';
-    }
-}
-
-// ── Components ───────────────────────────────────────────────
 
 function Header() {
-    // ASCII art header with gradient colors
-    const title = [
-        '╔╗╔═╦═╦═╦═╦═╦═╦╗╔╗',
-        '║╠╣╔╣╩╣╬║╩╣╔╣╬║╠╣║',
-        '╚╝╚╝╚═╩═╩═╩╝╚═╩╝╚╝',
+    const logo = [
+        '██╗  ██╗███████╗██╗   ██╗██████╗ ███████╗██████╗',
+        '██║ ██╔╝██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗',
+        '█████╔╝ █████╗   ╚████╔╝ ██████╔╝█████╗  ██████╔╝',
+        '██╔═██╗ ██╔══╝    ╚██╔╝  ██╔═══╝ ██╔══╝  ██╔══██╗',
+        '██║  ██╗███████╗   ██║   ██║     ███████╗██║  ██║',
+        '╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝     ╚══════╝╚═╝  ╚═╝',
     ];
 
-    const colors = ['#00d4ff', '#00ccaa', '#00ff88'];
-
     return (
-        <Box flexDirection="column" alignItems="center" marginBottom={1}>
-            {title.map((line, i) => (
-                <Text key={i} color={colors[i]} bold>{line}</Text>
+        <Box flexDirection="column" marginBottom={1}>
+            {logo.map((line, index) => (
+                <Text key={line} color={index < 2 ? '#8FF7A7' : index < 4 ? '#6CEBFF' : '#93A1FF'}>
+                    {line}
+                </Text>
             ))}
-            <Text color="#888" dimColor>Post-Quantum Peer-to-Peer VPN</Text>
+            <Text color="#8B93A7">POST-QUANTUM OVERLAY VPN // RELAY-ASSISTED DEMO BUILD</Text>
         </Box>
     );
 }
 
-interface StatusBoxProps {
-    stats: VPNStats;
-    peerId: string;
-}
-
-function StatusBox({ stats, peerId }: StatusBoxProps) {
+function Strip({ label, value, color = '#C5CBD8' }: { label: string; value: string; color?: string }) {
     return (
-        <Box
-            flexDirection="column"
-            borderStyle="round"
-            borderColor={stateColor(stats.state)}
-            paddingX={2}
-            paddingY={0}
-            marginBottom={1}
-        >
-            <Box>
-                <Text color={stateColor(stats.state)} bold>
-                    {stateIcon(stats.state)} {stats.state.toUpperCase()}
-                </Text>
-                <Text color="#666"> │ </Text>
-                <Text color="#aaa">Peer ID: </Text>
-                <Text color="cyan" bold>{peerId}</Text>
-            </Box>
-
-            <Box marginTop={0}>
-                <Text color="#aaa">Crypto: </Text>
-                <Text color="#ffaa00">{stats.cryptoMode}</Text>
-            </Box>
-
-            {stats.state === ConnectionState.Connected && (
-                <Box>
-                    <Text color="#aaa">Latency: </Text>
-                    <Text color={stats.latencyMs < 50 ? 'green' : stats.latencyMs < 150 ? 'yellow' : 'red'}>
-                        {stats.latencyMs}ms
-                    </Text>
-                    <Text color="#666"> │ </Text>
-                    <Text color="#aaa">Uptime: </Text>
-                    <Text color="white">{formatUptime(stats.connectedAt)}</Text>
-                </Box>
-            )}
+        <Box width={38}>
+            <Text color="#525869">{label.padEnd(14, ' ')}</Text>
+            <Text color={color}>{value}</Text>
         </Box>
     );
 }
 
-interface StatsBoxProps {
-    stats: VPNStats;
-}
-
-function StatsPanel({ stats }: StatsBoxProps) {
+function Dashboard({ stats, peerId }: { stats: VPNStats; peerId: string }) {
     return (
-        <Box
-            flexDirection="column"
-            borderStyle="single"
-            borderColor="#444"
-            paddingX={2}
-            paddingY={0}
-            marginBottom={1}
-        >
-            <Text color="#888" bold>── Traffic Stats ──</Text>
-            <Box>
-                <Box width={30}>
-                    <Text color="#aaa">↑ Sent: </Text>
-                    <Text color="green" bold>{formatBytes(stats.bytesSent)}</Text>
-                </Box>
-                <Box width={30}>
-                    <Text color="#aaa">↓ Received: </Text>
-                    <Text color="blue" bold>{formatBytes(stats.bytesReceived)}</Text>
-                </Box>
+        <Box flexDirection="column" borderStyle="double" borderColor={stateTone(stats.state)} paddingX={1}>
+            <Text color={stateTone(stats.state)}>
+                LINK {stats.state.toUpperCase()} // {peerId}
+            </Text>
+            <Box marginTop={1}>
+                <Strip label="crypto" value={stats.cryptoMode} color="#FFE082" />
+                <Strip label="transport" value={stats.transportMode} color="#7CE7FF" />
             </Box>
             <Box>
-                <Box width={30}>
-                    <Text color="#aaa">📦 Packets Out: </Text>
-                    <Text color="white">{stats.packetsSent.toLocaleString()}</Text>
-                </Box>
-                <Box width={30}>
-                    <Text color="#aaa">📦 Packets In: </Text>
-                    <Text color="white">{stats.packetsReceived.toLocaleString()}</Text>
-                </Box>
+                <Strip label="morphing" value={stats.morphMode} color="#9AF7B3" />
+                <Strip label="peer" value={stats.peerId ?? 'waiting'} color="#9DB5FF" />
+            </Box>
+            <Box>
+                <Strip label="vpn-ip" value={stats.peerVpnIp ?? 'n/a'} />
+                <Strip label="latency" value={`${stats.latencyMs}ms`} color="#FFB86C" />
+            </Box>
+            <Box>
+                <Strip label="uplink" value={formatBytes(stats.bytesSent)} color="#6CFF8F" />
+                <Strip label="downlink" value={formatBytes(stats.bytesReceived)} color="#62F2FF" />
+            </Box>
+            <Box>
+                <Strip label="pkts-out" value={stats.packetsSent.toString()} />
+                <Strip label="pkts-in" value={stats.packetsReceived.toString()} />
+            </Box>
+            <Box>
+                <Strip label="uptime" value={uptime(stats.connectedAt)} />
             </Box>
         </Box>
     );
 }
 
-interface PeerListProps {
-    stats: VPNStats;
-}
-
-function PeerList({ stats }: PeerListProps) {
-    if (!stats.peerId) {
-        return (
-            <Box borderStyle="single" borderColor="#444" paddingX={2}>
-                <Text color="#666" italic>No peers connected</Text>
-            </Box>
-        );
-    }
-
+function LogPane({ logs }: { logs: string[] }) {
     return (
-        <Box
-            flexDirection="column"
-            borderStyle="single"
-            borderColor="#444"
-            paddingX={2}
-            paddingY={0}
-            marginBottom={1}
-        >
-            <Text color="#888" bold>── Connected Peer ──</Text>
-            <Box>
-                <Text color="#aaa">ID: </Text>
-                <Text color="cyan" bold>{stats.peerId}</Text>
-                <Text color="#666"> │ </Text>
-                <Text color="#aaa">VPN IP: </Text>
-                <Text color="green" bold>{stats.peerVpnIp ?? 'n/a'}</Text>
-                <Text color="#666"> │ </Text>
-                <Text color={stateColor(stats.state)}>
-                    {stateIcon(stats.state)} {stats.state}
-                </Text>
-            </Box>
-        </Box>
-    );
-}
-
-interface LogViewProps {
-    logs: string[];
-}
-
-function LogView({ logs }: LogViewProps) {
-    const recent = logs.slice(-6);
-    return (
-        <Box
-            flexDirection="column"
-            borderStyle="single"
-            borderColor="#333"
-            paddingX={2}
-            paddingY={0}
-            marginBottom={1}
-        >
-            <Text color="#888" bold>── Log ──</Text>
-            {recent.map((log, i) => (
-                <Text key={i} color="#555">{log}</Text>
+        <Box flexDirection="column" borderStyle="single" borderColor="#343946" paddingX={1} marginTop={1}>
+            <Text color="#8B93A7">EVENT STREAM</Text>
+            {logs.slice(-8).map((line) => (
+                <Text key={line} color="#B6BECE">{line}</Text>
             ))}
         </Box>
     );
 }
 
-function Controls() {
+function Footer() {
     return (
-        <Box>
-            <Text color="#555">Press </Text>
-            <Text color="red" bold>Ctrl+C</Text>
-            <Text color="#555"> to disconnect</Text>
+        <Box marginTop={1}>
+            <Text color="#525869">Controls: </Text>
+            <Text color="#9AF7B3">e</Text>
+            <Text color="#525869"> send encrypted echo  </Text>
+            <Text color="#9AF7B3">ctrl+c</Text>
+            <Text color="#525869"> exit</Text>
         </Box>
     );
 }
 
-// ── Main App ─────────────────────────────────────────────────
-
-interface AppProps {
-    tunnel: VPNTunnel;
-}
-
-function App({ tunnel }: AppProps) {
+function App({ tunnel }: { tunnel: VPNTunnel }) {
     const { exit } = useApp();
     const [stats, setStats] = useState<VPNStats>(tunnel.getStats());
     const [logs, setLogs] = useState<string[]>([]);
 
     useEffect(() => {
-        const onStats = (newStats: VPNStats) => setStats(newStats);
-        const onLog = (msg: string) => {
-            setLogs((prev) => [...prev.slice(-50), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+        const onStats = (nextStats: VPNStats) => setStats(nextStats);
+        const onLog = (message: string) => {
+            const stamp = new Date().toLocaleTimeString();
+            setLogs((current) => [...current.slice(-30), `[${stamp}] ${message}`]);
         };
 
         tunnel.on('stats', onStats);
@@ -254,23 +149,22 @@ function App({ tunnel }: AppProps) {
 
     useInput((input, key) => {
         if (key.ctrl && input === 'c') {
-            tunnel.shutdown().then(() => exit());
+            tunnel.shutdown().finally(() => exit());
+        }
+        if (input === 'e') {
+            tunnel.sendTestData();
         }
     });
 
     return (
         <Box flexDirection="column" paddingX={1}>
             <Header />
-            <StatusBox stats={stats} peerId={tunnel.getPeerId()} />
-            <StatsPanel stats={stats} />
-            <PeerList stats={stats} />
-            <LogView logs={logs} />
-            <Controls />
+            <Dashboard stats={stats} peerId={tunnel.getPeerId()} />
+            <LogPane logs={logs} />
+            <Footer />
         </Box>
     );
 }
-
-// ── Render function ──────────────────────────────────────────
 
 export function renderApp(tunnel: VPNTunnel): void {
     render(React.createElement(App, { tunnel }));
